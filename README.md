@@ -118,8 +118,9 @@ Tests use disposable homes/databases. The native integration runs real
 create/claim/request-review/reviewer-claim APIs, native hook merging and the
 model-facing `kanban_complete` handler. The frozen test-only external guard
 oracle preserves the original consumer checks without importing the workspace.
-Without the hook, genuine completion reproduces the missing-approval rejection;
-with it, ordinary prose produces a valid exact-SHA approval record. Conflicting
+Without the hook, native completion succeeds but the downstream exact-review
+guard rejects the record because the reviewed SHA is missing. With the hook,
+ordinary prose produces a valid exact-SHA approval record. Conflicting
 approval and wrong-SHA calls leave the run open. Other tests cover authorization,
 handoff provenance, metadata preservation, pass-through and idempotence.
 These tests and Doctor do not prove live installation, human review or production

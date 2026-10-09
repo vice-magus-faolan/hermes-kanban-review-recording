@@ -29,10 +29,10 @@ def main() -> int:
         return 2
     # Dirty native files would defeat the exact-source compatibility assertion.
     changed = subprocess.check_output(
-        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"], text=True,
+        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"], text=True,
     ).strip()
     if changed:
-        print("Native test source has tracked changes; use a clean checkout.", file=sys.stderr)
+        print("Native test source has tracked or untracked changes; use a clean checkout.", file=sys.stderr)
         return 2
     scratch = Path(os.environ.get("TMPDIR", ROOT / ".test-scratch")).resolve()
     scratch.mkdir(parents=True, exist_ok=True)
