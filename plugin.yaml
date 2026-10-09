@@ -1,0 +1,9 @@
+name: kanban-review-recording
+version: 0.1.0
+kind: standalone
+description: "Record affirmative native Kanban review completion as structured approval metadata."
+author: Hermes control plane
+platforms:
+  - linux
+hooks:
+  - pre_tool_call
