@@ -111,7 +111,9 @@ export HERMES_AGENT_ROOT="$PWD/.hermes-runtime-source"
 
 The same canonical command is `python3 scripts/verify.py` when the interpreter
 already has the declared test dependencies. It refuses missing/wrong/dirty core
-source, test failures and skips, and runs native Plugin Doctor. CI checks out
+source, test failures and skips, and calls the native Plugin Doctor CLI handler
+on an exact two-file runtime bundle. It does not launch Hermes installation repair
+or copy test scratch/core checkouts into the plugin. CI checks out
 that exact core commit into an isolated checkout and runs this command.
 
 Tests use disposable homes/databases. The native integration runs real
