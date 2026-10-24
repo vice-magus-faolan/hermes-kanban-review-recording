@@ -254,6 +254,77 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(set(ctx.hooks), {"pre_tool_call"})
         self.assertIsNone(ctx.hooks["pre_tool_call"](tool_name="kanban_show", args={}))
 
+    def report_handoff(self, **overrides: Any) -> list[dict[str, str]]:
+        artifacts = [
+            {"path": "/reports/assessment.md", "sha256": "c" * 64},
+            {"path": "/reports/evidence.json", "sha256": "d" * 64},
+        ]
+        metadata = {"artifact_kind": "report", "artifacts": artifacts, **overrides}
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE task_runs SET metadata=? WHERE id=1", (json.dumps(metadata),))
+        return artifacts
+
+    def test_report_identity_is_preserved_and_idempotent(self) -> None:
+        artifacts = self.report_handoff()
+        updated = self.complete({"note": "kept"})["args"]["metadata"]
+        self.assertEqual(updated, {"note": "kept", "approved": True,
+                         "review_outcome": "approved", "artifact_kind": "report",
+                         "reviewed_artifacts": artifacts})
+        self.assertEqual(self.complete(updated)["args"]["metadata"], updated)
+
+    def test_report_requires_complete_unambiguous_handoff_identities(self) -> None:
+        invalid = [
+            {"artifacts": None}, {"artifacts": []}, {"artifacts": {}},
+            {"artifacts": [{"path": "/reports/a"}]},
+            {"artifacts": [{"sha256": "c" * 64}]},
+            {"artifacts": [{"path": "relative.md", "sha256": "c" * 64}]},
+            {"artifacts": [{"path": "/reports/../a", "sha256": "c" * 64}]},
+            {"artifacts": [{"path": "/reports/a\u0000", "sha256": "c" * 64}]},
+            {"artifacts": [{"path": "/reports/a", "sha256": "C" * 64}]},
+            {"artifacts": [{"path": "/reports/a", "sha256": "c" * 63}]},
+            {"artifacts": [{"path": "/reports/a", "sha256": "c" * 64, "extra": True}]},
+            {"artifacts": [{"path": "/reports/a", "sha256": "c" * 64}] * 2},
+            {"commit": SHA}, {"commit": None}, {"reviewed_commit": SHA},
+            {"artifact_kind": "git", "commit": SHA},
+            {"artifact_kind": "unknown"}, {"artifact_kind": None},
+        ]
+        for overrides in invalid:
+            with self.subTest(overrides=overrides):
+                self.report_handoff(**overrides)
+                self.assertEqual(self.complete({})["action"], "block")
+
+    def test_report_completion_cannot_rebind_or_mix_identity(self) -> None:
+        artifacts = self.report_handoff()
+        for metadata in (
+            {"artifact_kind": "git"}, {"artifact_kind": None},
+            {"commit": SHA}, {"reviewed_commit": SHA}, {"reviewed_commit": None},
+            {"reviewed_artifacts": []}, {"reviewed_artifacts": list(reversed(artifacts))},
+            {"artifacts": [{**artifacts[0], "path": "/reports/other"}, artifacts[1]]},
+            {"reviewed_artifacts": [{**artifacts[0], "sha256": "e" * 64}, artifacts[1]]},
+            {"approved": False}, {"review_outcome": "changes_requested"},
+            {"blocking_findings": ["unresolved"]},
+        ):
+            with self.subTest(metadata=metadata):
+                self.assertEqual(self.complete(metadata)["action"], "block")
+
+    def test_git_handoff_cannot_be_reinterpreted_as_report(self) -> None:
+        for metadata in ({"artifact_kind": "report"}, {"artifacts": []},
+                         {"reviewed_artifacts": []}, {"commit": "b" * 40}):
+            with self.subTest(metadata=metadata):
+                self.assertEqual(self.complete(metadata)["action"], "block")
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE task_runs SET metadata=? WHERE id=1", (
+                json.dumps({"artifacts": [{"path": "/reports/a", "sha256": "c" * 64}]}),))
+        self.assertEqual(self.complete({})["action"], "block")
+
+    def test_report_still_requires_independent_authorized_native_review(self) -> None:
+        self.report_handoff()
+        for profile in ("builder", "outsider"):
+            with self.subTest(profile=profile):
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    conn.execute("UPDATE task_runs SET profile=? WHERE id=2", (profile,))
+                self.assertEqual(self.complete({})["action"], "block")
+
 
 if __name__ == "__main__":
     unittest.main()

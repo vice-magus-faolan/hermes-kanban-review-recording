@@ -44,21 +44,24 @@ class NativeCompletionTests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
         self.conn = connections.connect(board="fixture")
         self.addCleanup(self.conn.close)
+        self.start_review({"commit": SHA})
+        self.policy = self.home / "kanban" / "delivery-policy.json"
+        self.policy.write_text(json.dumps({"policy_version": 2, "boards": {"fixture": {
+            "mode": "git", "review": {"required": True, "allowed_profiles": ["reviewer"]},
+        }}}))
+
+    def start_review(self, metadata: dict) -> None:
         self.task = native.create_task(self.conn, title="Recording fixture", assignee="builder", board="fixture")
         self.assertIsNotNone(native.claim_task(self.conn, self.task, claimer="fixture-builder"))
         builder_run = native.latest_run(self.conn, self.task)
         assert builder_run is not None
         self.builder = builder_run.id
-        self.assertTrue(native.request_review(self.conn, self.task, reviewer="reviewer", summary="Ready for independent review", metadata={"commit": SHA}, expected_run_id=self.builder))
+        self.assertTrue(native.request_review(self.conn, self.task, reviewer="reviewer", summary="Ready for independent review", metadata=metadata, expected_run_id=self.builder))
         self.assertIsNotNone(native.claim_review_task(self.conn, self.task, claimer="fixture-reviewer"))
         reviewer_run = native.latest_run(self.conn, self.task)
         assert reviewer_run is not None
         self.reviewer = reviewer_run.id
         os.environ.update({"HERMES_KANBAN_TASK": self.task, "HERMES_KANBAN_RUN_ID": str(self.reviewer)})
-        self.policy = self.home / "kanban" / "delivery-policy.json"
-        self.policy.write_text(json.dumps({"policy_version": 2, "boards": {"fixture": {
-            "mode": "git", "review": {"required": True, "allowed_profiles": ["reviewer"]},
-        }}}))
 
     def dispatch_completion(self, args: dict) -> dict:
         # Use the real plugin callback manager and native argument-merging path,
@@ -110,6 +113,42 @@ class NativeCompletionTests(unittest.TestCase):
         task = native.get_task(self.conn, self.task)
         assert task is not None
         self.assertEqual(task.status, "running")
+
+    def test_report_completion_records_artifacts_not_source_approval(self) -> None:
+        artifacts = [
+            {"path": "/reports/assessment.md", "sha256": "c" * 64},
+            {"path": "/reports/evidence.json", "sha256": "d" * 64},
+        ]
+        self.start_review({"artifact_kind": "report", "artifacts": artifacts})
+        result = self.dispatch_completion({"task_id": self.task, "summary": "Reviewed both reports."})
+        self.assertTrue(result.get("ok"), result)
+        task = native.get_task(self.conn, self.task)
+        assert task is not None
+        self.assertEqual(task.status, "done")
+        verdict = native.latest_run(self.conn, self.task)
+        assert verdict is not None and verdict.metadata is not None
+        metadata = verdict.metadata if isinstance(verdict.metadata, dict) else json.loads(verdict.metadata)
+        self.assertEqual(metadata["artifact_kind"], "report")
+        self.assertEqual(metadata["reviewed_artifacts"], artifacts)
+        self.assertIs(metadata["approved"], True)
+        self.assertEqual(metadata["review_outcome"], "approved")
+        self.assertNotIn("reviewed_commit", metadata)
+        self.assertNotIn("commit", metadata)
+        source_approval = guard.verify_exact_review(self.conn, self.task, SHA, {"reviewer"})
+        self.assertFalse(source_approval["approved"], source_approval)
+
+    def test_report_identity_refusals_leave_native_review_open(self) -> None:
+        artifacts = [{"path": "/reports/assessment.md", "sha256": "c" * 64}]
+        self.start_review({"artifact_kind": "report", "artifacts": artifacts})
+        for metadata in ({"reviewed_commit": SHA}, {"reviewed_artifacts": []},
+                         {"approved": False}):
+            with self.subTest(metadata=metadata):
+                result = self.dispatch_completion({"task_id": self.task, "summary": "Report verdict", "metadata": metadata})
+                self.assertTrue(result.get("blocked"), result)
+                task = native.get_task(self.conn, self.task)
+                assert task is not None
+                self.assertEqual(task.status, "running")
+                self.assertEqual(task.current_run_id, self.reviewer)
 
 
 if __name__ == "__main__":

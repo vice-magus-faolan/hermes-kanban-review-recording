@@ -19,6 +19,23 @@ candidate SHA from the latest valid builder handoff and supplies:
 - `review_outcome: approved`
 - `reviewed_commit: <the builder's exact full SHA>`
 
+Report-only handoffs must explicitly declare `artifact_kind: report` and
+`artifacts: [{"path": "/reports/assessment.md", "sha256": "<64 lowercase hex>"}]`
+in builder metadata. The list must be nonempty, with unique canonical absolute
+POSIX file paths (no dot segments, repeated separators, trailing slash or control
+characters), and each entry must have exactly those two fields. Order and path
+spelling are retained, not normalized. Report handoffs cannot contain `commit`,
+`reviewed_commit` or `reviewed_artifacts`. Completion records `artifact_kind:
+report` and the identical list as `reviewed_artifacts`, plus the two approval
+fields above, never `reviewed_commit`. Any explicitly supplied identity must
+match, including list order. Missing/malformed Git identity never implies report
+permission; Git handoffs cannot carry report identity fields.
+
+This trusts the builder's explicit non-code classification and the authorized
+reviewer's completion action, not inferred file extensions. The plugin does not
+read or hash remote files. Artifact-only approval cannot satisfy the unchanged
+Git/source delivery guard and grants no source publication or runtime authority.
+
 It preserves the report, artifacts and unrelated metadata. Explicit negative
 approval, a mismatched SHA, blocking findings, unauthorized/self-review, invalid
 handoffs or policy failures are refused **before** native completion. Ordinary
@@ -98,23 +115,32 @@ commit `f42f579cf8bac4918ac9599bece71618afadd846`. The test dependencies below a
 only for an isolated test environment, not plugin dependencies or permission to
 pip-edit a live Hermes generation.
 
-From this repository:
+From this repository on a Docker-capable development host:
 
 ```sh
-git clone https://github.com/NousResearch/hermes-agent.git .hermes-runtime-source
-git -C .hermes-runtime-source checkout --detach f42f579cf8bac4918ac9599bece71618afadd846
-python3 -m venv .venv-test
-.venv-test/bin/python -m pip install -r requirements-test.txt
-export HERMES_AGENT_ROOT="$PWD/.hermes-runtime-source"
-.venv-test/bin/python scripts/verify.py
+mkdir -p .docker-input
+git init .docker-input/hermes-source
+git -C .docker-input/hermes-source fetch --depth 1 https://github.com/NousResearch/hermes-agent.git f42f579cf8bac4918ac9599bece71618afadd846
+git -C .docker-input/hermes-source checkout --detach FETCH_HEAD
+cp requirements-test.txt .docker-input/
+docker build -f docker/Dockerfile -t hermes-kanban-review-recording:test .docker-input
+bash scripts/verify-docker.sh
 ```
 
-The same canonical command is `python3 scripts/verify.py` when the interpreter
-already has the declared test dependencies. It refuses missing/wrong/dirty core
+The image exports the upstream locked runtime dependencies through its supported
+PM route, then installs them and the test prerequisites inside Docker. Tests run
+non-root, network-denied, resource-bounded, with read-only source/root and writable
+scratch only. The wrapper removes its own container and checks for owned resource
+leftovers on success/failure; it retains the test exit and reports cleanup status.
+The reusable test image remains; no host test environment is installed.
+
+Inside Docker the canonical command remains `python3 scripts/verify.py`.
+It refuses missing/wrong/dirty core
 source, test failures and skips, and calls the native Plugin Doctor CLI handler
 on an exact two-file runtime bundle. It does not launch Hermes installation repair
-or copy test scratch/core checkouts into the plugin. CI checks out
-that exact core commit into an isolated checkout and runs this command.
+or copy test scratch/core checkouts into the plugin. CI uses the same Docker
+route for PRs and main pushes. Shared runtime/test-infrastructure changes affect
+the whole small suite, so verification remains full rather than selecting tests.
 
 Tests use disposable homes/databases. The native integration runs real
 create/claim/request-review/reviewer-claim APIs, native hook merging and the
