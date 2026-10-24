@@ -115,7 +115,8 @@ commit `f42f579cf8bac4918ac9599bece71618afadd846`. The test dependencies below a
 only for an isolated test environment, not plugin dependencies or permission to
 pip-edit a live Hermes generation.
 
-From this repository on a Docker-capable development host:
+From the Git repository root on a Docker-capable development host (Bash, Git
+and GNU coreutils required):
 
 ```sh
 mkdir -p .docker-input
@@ -125,13 +126,19 @@ git -C .docker-input/hermes-source checkout --detach FETCH_HEAD
 cp requirements-test.txt .docker-input/
 docker build -f docker/Dockerfile -t hermes-kanban-review-recording:test .docker-input
 bash scripts/verify-docker.sh
+bash scripts/test-docker-inputs.sh
 ```
 
 The image exports the upstream locked runtime dependencies through its supported
 PM route, then installs them and the test prerequisites inside Docker. Tests run
 non-root, network-denied, resource-bounded, with read-only source/root and writable
-scratch only. The wrapper removes its own container and checks for owned resource
-leftovers on success/failure; it retains the test exit and reports cleanup status.
+scratch only. The wrapper mounts an owned snapshot of deliberate runtime/test
+inputs, not the checkout: ignored files, Git metadata and build inputs stay out.
+It includes working-tree edits and new nonignored tests; see [contributing](CONTRIBUTING.md)
+for the supported input formats. The wrapper removes its snapshot and container
+and checks for owned resource leftovers on success/failure; it retains the test
+exit and reports cleanup status. The real-Docker privacy regression checks fake
+ignored-file canaries and intentional command failure, and runs in CI.
 The reusable test image remains; no host test environment is installed.
 
 Inside Docker the canonical command remains `python3 scripts/verify.py`.

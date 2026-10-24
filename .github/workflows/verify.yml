@@ -31,5 +31,7 @@ jobs:
           docker build -f docker/Dockerfile -t hermes-kanban-review-recording:test .docker-input
       - name: Canonical verification (no live installation)
         run: bash scripts/verify-docker.sh
+      - name: Docker source privacy and failure cleanup
+        run: bash scripts/test-docker-inputs.sh
       - name: Runtime complexity
         run: bash scripts/verify-docker.sh ruff check --no-cache --isolated --select C901 --config 'lint.mccabe.max-complexity = 10' __init__.py scripts/verify.py
