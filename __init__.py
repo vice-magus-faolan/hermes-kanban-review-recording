@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import quote
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_PATH_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _BOARD = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}\Z")
 _PROFILE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _BLOCK = "kanban review approval refused: "
@@ -93,8 +95,42 @@ def _policy(policy_path: str, board: str) -> tuple[bool, tuple[str, ...]]:
     return required, tuple(profiles)
 
 
-def _review_state(db: Path, task: str, run_id: int) -> tuple[str, str | None]:
-    """Return scope plus latest handoff SHA, relying only on durable run/event data."""
+def _report_artifacts(value: object) -> list[dict[str, str]]:
+    """Validate declared identities only; never read or normalize remote paths."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("report artifacts must be a nonempty list")
+    seen = set()
+    for artifact in value:
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
+            raise ValueError("report artifact requires exactly path and sha256")
+        path, digest = artifact["path"], artifact["sha256"]
+        if not isinstance(path, str) or not path.startswith("/") or _PATH_CONTROL.search(path):
+            raise ValueError("report artifact path must be an absolute POSIX file path")
+        if any(part in ("", ".", "..") for part in path[1:].split("/")) or path in seen:
+            raise ValueError("report artifact paths must be canonical and unique")
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            raise ValueError("report artifact requires a full lowercase SHA256")
+        seen.add(path)
+    return value
+
+
+def _handoff_identity(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Require an explicit report declaration; a missing Git SHA is never fallback."""
+    kind = metadata.get("artifact_kind", "git")
+    if kind == "report":
+        if any(key in metadata for key in ("commit", "reviewed_commit", "reviewed_artifacts")):
+            raise ValueError("report handoff contains mixed approval identity")
+        return {"artifact_kind": "report", "reviewed_artifacts": _report_artifacts(metadata.get("artifacts"))}
+    if kind != "git" or any(key in metadata for key in ("artifacts", "reviewed_artifacts")):
+        raise ValueError("handoff has ambiguous artifact kind or mixed identity")
+    sha = metadata.get("commit")
+    if not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha):
+        raise ValueError("latest builder handoff has no valid full commit SHA")
+    return {"reviewed_commit": sha}
+
+
+def _review_state(db: Path, task: str, run_id: int) -> tuple[str, dict[str, Any] | None]:
+    """Return scope and latest handoff identity using durable run/event data."""
     uri = "file:" + quote(str(db), safe="/") + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
         row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task,)).fetchone()
@@ -123,24 +159,40 @@ def _review_state(db: Path, task: str, run_id: int) -> tuple[str, str | None]:
             raise ValueError("review handoff was invalidated by requested changes")
         if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='review_requested'", (task, handoff[0])).fetchone():
             raise ValueError("native review-request event is missing")
-        sha = _json_object(handoff[5]).get("commit")
-        if not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha):
-            raise ValueError("latest builder handoff has no valid full commit SHA")
-        return "review", sha
+        return "review", _handoff_identity(_json_object(handoff[5]))
+
+
+def _approval_metadata(metadata: object, identity: dict[str, Any]) -> dict[str, Any]:
+    """Bind explicit verdict fields without overwriting contradictions."""
+    metadata = {} if metadata is None else metadata
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    if "approved" in metadata and metadata["approved"] is not True:
+        raise ValueError("explicit approval metadata is contradictory")
+    if "review_outcome" in metadata and metadata["review_outcome"] != "approved":
+        raise ValueError("explicit review outcome is contradictory")
+    if metadata.get("blocking_findings") not in (None, [], (), ""):
+        raise ValueError("blocking findings are present")
+    if identity.get("artifact_kind") == "report":
+        forbidden = ("commit", "reviewed_commit")
+        expected = {**identity, "artifacts": identity["reviewed_artifacts"]}
+    else:
+        forbidden = ("artifacts", "reviewed_artifacts")
+        expected = {**identity, "artifact_kind": "git", "commit": identity["reviewed_commit"]}
+    if any(key in metadata for key in forbidden):
+        raise ValueError("completion contains mixed Git/report identity")
+    for key, value in expected.items():
+        if key in metadata and metadata[key] != value:
+            raise ValueError(f"explicit {key} does not match latest builder handoff")
+    return {**metadata, **identity, "approved": True, "review_outcome": "approved"}
 
 
 def prepare_completion(args: dict[str, Any]) -> dict[str, Any] | None:
     """Return native hook directive; None means intentionally leave call unchanged."""
-    if args.get("task_id") and args.get("task_id") != os.environ.get("HERMES_KANBAN_TASK"):
-        return None
     env = os.environ.get("HERMES_KANBAN_TASK")
-    if not env:
+    if not env or (args.get("task_id") and args["task_id"] != env):
         return None
-    metadata = args.get("metadata", {})
-    if metadata is None:
-        metadata = {}
-    if not isinstance(metadata, dict):
-        return _deny("metadata must be an object")
+
     # Policy/path failures are fatal only once the configured board is in scope.
     try:
         context = _context()
@@ -156,7 +208,7 @@ def prepare_completion(args: dict[str, Any]) -> dict[str, Any] | None:
     if not required:
         return None
     try:
-        scope, sha = _review_state(db, task, run_id)
+        scope, identity = _review_state(db, task, run_id)
     except (sqlite3.Error, OSError, ValueError) as exc:
         return _deny(f"cannot validate active review run: {exc}")
     if scope == "ordinary":
@@ -168,17 +220,11 @@ def prepare_completion(args: dict[str, Any]) -> dict[str, Any] | None:
     reviewer = reviewer_row[0] if reviewer_row else None
     if reviewer not in allowed:
         return _deny("active reviewer is not authorized by durable board policy")
-    if "approved" in metadata and metadata["approved"] is not True:
-        return _deny("explicit approval metadata is contradictory")
-    if "review_outcome" in metadata and metadata["review_outcome"] != "approved":
-        return _deny("explicit review outcome is contradictory")
-    if "reviewed_commit" in metadata and metadata["reviewed_commit"] != sha:
-        return _deny("explicit reviewed commit does not match latest builder handoff")
-    findings = metadata.get("blocking_findings")
-    if findings not in (None, [], (), ""):
-        return _deny("blocking findings are present")
-    updated = dict(metadata)
-    updated.update(approved=True, review_outcome="approved", reviewed_commit=sha)
+    try:
+        assert identity is not None
+        updated = _approval_metadata(args.get("metadata"), identity)
+    except ValueError as exc:
+        return _deny(str(exc))
     return {"action": "modify", "args": {"metadata": updated}}
 
 

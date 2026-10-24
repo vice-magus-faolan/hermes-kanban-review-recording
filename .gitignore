@@ -3,3 +3,4 @@ __pycache__/
 /.venv-test/
 /.hermes-runtime-source/
 /.test-scratch/
+/.docker-input/
